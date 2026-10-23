@@ -1024,8 +1024,14 @@ mod tests {
         let mountpoint = FakeMountpoint {
             ready: RefCell::new(true),
         };
-        let runtime =
-            MountRuntime::new(&paths, &processes, &rc, &mountpoint).with_options(options());
+        // The first readiness snapshot deliberately has pre-exec arguments. Allow
+        // scheduler time to reach the next snapshot; this is not a timeout test.
+        let runtime = MountRuntime::new(&paths, &processes, &rc, &mountpoint).with_options(
+            RuntimeOptions {
+                ready_timeout: Duration::from_secs(1),
+                ..options()
+            },
+        );
 
         let mounted = runtime
             .mount(MountRequest {
