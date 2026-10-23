@@ -27,6 +27,15 @@ Cancelling an HTTP request cannot undo a registration already accepted by the se
 Deleting a connection also does not revoke the remote public key: use the SAI console to
 remove it. Local keys remain available for retry and connections that reference them.
 
+Only a `key_revoked` or `key_expired` result offers **Authorize with a new key**. This
+explicit action rechecks the current operation's terminal state, writes a new private key
+to `id_ed25519.<new request ID>` in the existing account/site directory, then atomically
+updates its `current-key` selector under the existing lock. Older private files and saved
+connection paths stay intact. Retries, cancellation and sign-in after restart use the selected
+key and request ID, including after an ambiguous registration response. A stale recovery
+action resumes an already replaced current key rather than rotating it again. Invalid or
+missing selected-key data fails closed instead of falling back to a retired key.
+
 Production trust roots are Portal `https://www.open-sai.com` and Identity issuer
 `https://id.open-sai.com/realms/sai`. There is no production HTTP/issuer override. HTTP keeps
 normal system proxy behavior, TLS validation, no redirects, 10-second connect and 20-second
@@ -163,6 +172,8 @@ before a key or site side effect exists, an explicit POST retry can reopen confi
 the same immutable actor/site/key/request after current eligibility is checked. GET does not
 renew approval. An already created, revoked or expired key cannot be resurrected by retrying
 its old operation. MountMate does not overwrite a private key referenced by saved connections.
+The explicit new-key action creates a new operation which still requires current access,
+fresh browser confirmation and the site's `applied` result.
 
 Return 401 for invalid/expired authorization, 403 for missing permission or required account
 action. Remote key revocation continues to use the existing SAI console. Enable v2 capability

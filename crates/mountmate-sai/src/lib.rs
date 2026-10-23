@@ -60,11 +60,9 @@ pub enum Error {
     SyncFailed,
     #[error("Browser confirmation expired. Retry to confirm the same local key.")]
     ApprovalExpired,
-    #[error(
-        "This SSH key was revoked. Check access in the SAI console; retrying cannot restore it."
-    )]
+    #[error("This SSH key was revoked. Authorize with a new key to connect again.")]
     KeyRevoked,
-    #[error("This SSH key expired. Check access in the SAI console and configure a new key.")]
+    #[error("This SSH key expired. Authorize with a new key to connect again.")]
     KeyExpired,
 }
 
@@ -361,6 +359,26 @@ impl Session {
         &self,
         site: &Connection,
         data_dir: &Path,
+        on_progress: impl FnMut(EnrollmentProgress),
+    ) -> Result<ConfiguredConnection, Error> {
+        self.enroll_key(site, data_dir, false, on_progress).await
+    }
+
+    /// Explicit recovery: replace only a currently confirmed revoked or expired key.
+    pub async fn reauthorize_with_progress(
+        &self,
+        site: &Connection,
+        data_dir: &Path,
+        on_progress: impl FnMut(EnrollmentProgress),
+    ) -> Result<ConfiguredConnection, Error> {
+        self.enroll_key(site, data_dir, true, on_progress).await
+    }
+
+    async fn enroll_key(
+        &self,
+        site: &Connection,
+        data_dir: &Path,
+        replace_retired: bool,
         mut on_progress: impl FnMut(EnrollmentProgress),
     ) -> Result<ConfiguredConnection, Error> {
         self.check_expiry()?;
@@ -374,10 +392,45 @@ impl Session {
             &site.site_id,
         ))
         .map_err(|_| Error::Contract)?;
-        let data_dir = data_dir.to_owned();
-        let key = tokio::task::spawn_blocking(move || key::load_or_create(&data_dir, &context))
-            .await
-            .map_err(|_| Error::KeyStorage)??;
+        let load_dir = data_dir.to_owned();
+        let load_context = context.clone();
+        let mut key =
+            tokio::task::spawn_blocking(move || key::load_or_create(&load_dir, &load_context))
+                .await
+                .map_err(|_| Error::KeyStorage)??;
+        let mut response = self.register_key(site, &key).await?;
+        if replace_retired
+            && matches!(
+                response.validate(
+                    &key.request_id,
+                    &site.site_id,
+                    &key.fingerprint,
+                    &self.client.portal,
+                    self.client.browser_verification,
+                ),
+                Err(Error::KeyRevoked | Error::KeyExpired)
+            )
+        {
+            let data_dir = data_dir.to_owned();
+            let retired = key.request_id.clone();
+            key = tokio::task::spawn_blocking(move || key::renew(&data_dir, &context, &retired))
+                .await
+                .map_err(|_| Error::KeyStorage)??;
+            response = self.register_key(site, &key).await?;
+        }
+        self.wait_for_key(response, &key, site, SYNC_LIMIT, &mut on_progress)
+            .await?;
+        Ok(ConfiguredConnection {
+            connection: site.clone(),
+            key_file: key.path,
+        })
+    }
+
+    async fn register_key(
+        &self,
+        site: &Connection,
+        key: &key::LocalKey,
+    ) -> Result<Enrollment, Error> {
         self.check_expiry()?;
         let registration = Registration {
             request_id: &key.request_id,
@@ -385,7 +438,7 @@ impl Session {
             public_key: &key.public_key,
             label: "SSH MountMate",
         };
-        let response: Enrollment = transport::json(
+        transport::json(
             self.client
                 .http
                 .send(
@@ -402,13 +455,7 @@ impl Session {
                         .json(&registration),
                 )
                 .await?,
-        )?;
-        self.wait_for_key(response, &key, site, SYNC_LIMIT, &mut on_progress)
-            .await?;
-        Ok(ConfiguredConnection {
-            connection: site.clone(),
-            key_file: key.path,
-        })
+        )
     }
     async fn wait_for_key(
         &self,

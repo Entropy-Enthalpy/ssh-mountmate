@@ -362,6 +362,176 @@ async fn browser_confirmation_timeout_is_distinct_from_site_sync_timeout() {
     );
     assert!(key.path.is_file());
 }
+
+#[tokio::test]
+async fn retired_key_requires_explicit_reauthorization_and_restart_resumes_the_new_intent() {
+    use sha2::{Digest, Sha256};
+    for (reason, error) in [
+        ("key_revoked", Error::KeyRevoked),
+        ("key_expired", Error::KeyExpired),
+    ] {
+        let retired = Arc::new(AtomicBool::new(false));
+        let approved = Arc::new(AtomicBool::new(false));
+        let retirement = retired.clone();
+        let approval = approved.clone();
+        let mut original: Option<Request> = None;
+        let mut replacement: Option<Request> = None;
+        let service = Fixture::new(move |request, origin| match request.path.as_str() {
+            "/v1/auth/config?client=ssh-mountmate" => Some(v2_configuration(request, origin)),
+            "/v1/account/ssh/keys" => {
+                let original = original.get_or_insert_with(|| request.clone());
+                if request.body == original.body {
+                    let mut response = enrollment(
+                        request,
+                        if retirement.load(Ordering::SeqCst) {
+                            "failed"
+                        } else {
+                            "applied"
+                        },
+                    );
+                    if retirement.load(Ordering::SeqCst) {
+                        response["reason"] = json!(reason);
+                    }
+                    return Some(reply(200, response));
+                }
+                if replacement.is_none() {
+                    replacement = Some(request.clone());
+                    return Some(reply(503, json!({})));
+                }
+                assert_eq!(replacement.as_ref().unwrap().body, request.body);
+                Some(reply(
+                    200,
+                    if approval.load(Ordering::SeqCst) {
+                        enrollment(request, "applied")
+                    } else {
+                        verification(request, origin)
+                    },
+                ))
+            }
+            path if path.starts_with("/v1/account/ssh/keys/") => {
+                let request = replacement.as_ref().unwrap();
+                Some(reply(
+                    200,
+                    if approval.load(Ordering::SeqCst) {
+                        enrollment(request, "applied")
+                    } else {
+                        verification(request, origin)
+                    },
+                ))
+            }
+            _ => None,
+        });
+        let root = tempfile::tempdir().unwrap();
+        let session = service.session().await;
+        let old = session
+            .enroll(&session.connections()[0], root.path())
+            .await
+            .unwrap();
+        let previous_bytes = Sha256::digest(std::fs::read(&old.key_file).unwrap());
+        let mut saved_draft = ConnectionDraft::default();
+        old.apply_to(&mut saved_draft);
+        let saved = saved_draft.validate(&[]).unwrap().server;
+        retired.store(true, Ordering::SeqCst);
+        assert_eq!(
+            session
+                .enroll(&session.connections()[0], root.path())
+                .await
+                .unwrap_err(),
+            error
+        );
+        // Only the explicit action can select a replacement. Ambiguous transport
+        // failure after selection must not manufacture another key on restart.
+        assert_eq!(
+            session
+                .reauthorize_with_progress(&session.connections()[0], root.path(), |_| {})
+                .await
+                .unwrap_err(),
+            Error::Network
+        );
+        assert_eq!(
+            Sha256::digest(std::fs::read(&old.key_file).unwrap()),
+            previous_bytes
+        );
+        drop(session);
+        let session = service.session().await;
+        let next = session
+            .enroll_with_progress(&session.connections()[0], root.path(), |event| {
+                if matches!(event, EnrollmentProgress::VerificationRequired(_)) {
+                    approved.store(true, Ordering::SeqCst);
+                }
+            })
+            .await
+            .unwrap();
+        assert_ne!(next.key_file, old.key_file);
+        assert_eq!(saved.key_file, old.key_file.to_string_lossy());
+        assert_eq!(
+            Sha256::digest(std::fs::read(&old.key_file).unwrap()),
+            previous_bytes
+        );
+        // A stale UI recovery action cannot rotate an already current valid key.
+        let resumed = session
+            .reauthorize_with_progress(&session.connections()[0], root.path(), |_| {})
+            .await
+            .unwrap();
+        assert_eq!(resumed.key_file, next.key_file);
+        let requests = service.requests.lock().unwrap();
+        let registrations: Vec<Value> = requests
+            .iter()
+            .filter(|r| r.path == "/v1/account/ssh/keys")
+            .map(|r| serde_json::from_str(&r.body).unwrap())
+            .collect();
+        assert_eq!(registrations.len(), 6);
+        assert_eq!(registrations[0], registrations[1]);
+        assert_eq!(registrations[1], registrations[2]);
+        assert_ne!(
+            registrations[2]["request_id"],
+            registrations[3]["request_id"]
+        );
+        assert_ne!(
+            registrations[2]["public_key"],
+            registrations[3]["public_key"]
+        );
+        assert_eq!(registrations[3], registrations[4]);
+        assert_eq!(registrations[4], registrations[5]);
+        assert_eq!(
+            std::fs::read_to_string(old.key_file.parent().unwrap().join("current-key")).unwrap(),
+            registrations[3]["request_id"].as_str().unwrap()
+        );
+    }
+}
+
+#[test]
+fn replacement_selector_cannot_escape_or_silently_replace_a_missing_current_key() {
+    let root = tempfile::tempdir().unwrap();
+    let previous = key::load_or_create(root.path(), b"context").unwrap();
+    let next = key::renew(root.path(), b"context", &previous.request_id).unwrap();
+    let again = key::renew(root.path(), b"context", &previous.request_id).unwrap();
+    assert_eq!(again.path, next.path);
+    assert_eq!(again.request_id, next.request_id);
+    let selector = previous.path.parent().unwrap().join("current-key");
+    std::fs::write(&selector, "../outside").unwrap();
+    assert!(matches!(
+        key::load_or_create(root.path(), b"context"),
+        Err(Error::KeyStorage)
+    ));
+    std::fs::write(&selector, &next.request_id).unwrap();
+    std::fs::remove_file(&next.path).unwrap();
+    assert!(matches!(
+        key::load_or_create(root.path(), b"context"),
+        Err(Error::KeyStorage)
+    ));
+    assert!(previous.path.is_file());
+    assert!(!next.path.exists());
+    #[cfg(unix)]
+    {
+        std::fs::remove_file(&selector).unwrap();
+        std::os::unix::fs::symlink(&previous.path, &selector).unwrap();
+        assert!(matches!(
+            key::load_or_create(root.path(), b"context"),
+            Err(Error::KeyStorage)
+        ));
+    }
+}
 #[tokio::test]
 async fn setup_waits_for_application_and_reuses_key_across_sessions() {
     let mut registered = None;

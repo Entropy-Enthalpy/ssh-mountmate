@@ -16,6 +16,7 @@ pub enum Message {
     Authorized(u64, Result<Arc<Session>, Error>),
     Select(Connection),
     Enroll,
+    Reauthorize,
     EnrollmentProgress(u64, EnrollmentProgress),
     Finished(u64, Result<ConfiguredConnection, Error>),
     OpenBrowser,
@@ -47,6 +48,9 @@ impl State {
     }
     pub fn in_progress(&self) -> bool {
         self.pending || self.session.is_some()
+    }
+    fn needs_new_key(&self) -> bool {
+        matches!(self.error, Some(Error::KeyRevoked | Error::KeyExpired))
     }
     fn track(&mut self, task: Task<Message>) -> Task<Message> {
         let (task, handle) = task.abortable();
@@ -113,24 +117,35 @@ impl State {
                     self.error = None;
                 }
             }
-            Message::Enroll if !self.pending => {
+            action @ (Message::Enroll | Message::Reauthorize) if !self.pending => {
+                let replace_retired = matches!(action, Message::Reauthorize);
+                if replace_retired && !self.needs_new_key() {
+                    return (Task::none(), None);
+                }
                 if let (Some(session), Some(site)) = (self.session.clone(), self.selected.clone()) {
                     self.pending = true;
                     self.error = None;
                     self.verification_url = None;
                     self.browser_failed = false;
+                    self.generation = self.generation.wrapping_add(1);
                     let generation = self.generation;
                     let data_dir = data_dir.to_owned();
                     let task = Task::run(
                         iced::stream::channel(2, async move |mut output| {
                             use iced::futures::SinkExt;
-                            let result = session
-                                .enroll_with_progress(&site, &data_dir, |progress| {
-                                    let _ = output.try_send(Message::EnrollmentProgress(
-                                        generation, progress,
-                                    ));
-                                })
-                                .await;
+                            let progress = |progress| {
+                                let _ = output
+                                    .try_send(Message::EnrollmentProgress(generation, progress));
+                            };
+                            let result = if replace_retired {
+                                session
+                                    .reauthorize_with_progress(&site, &data_dir, progress)
+                                    .await
+                            } else {
+                                session
+                                    .enroll_with_progress(&site, &data_dir, progress)
+                                    .await
+                            };
                             let _ = output.send(Message::Finished(generation, result)).await;
                         }),
                         |message| message,
@@ -266,7 +281,21 @@ impl State {
                         )
                         .width(Fill),
                     )
-                    .push(button(tr("Continue setup", "继续配置")).on_press(Message::Enroll));
+                    .push(if self.needs_new_key() {
+                        button(tr("Authorize with a new key", "使用新密钥重新授权"))
+                            .on_press(Message::Reauthorize)
+                    } else {
+                        button(tr("Continue setup", "继续配置")).on_press(Message::Enroll)
+                    });
+                if self.needs_new_key() {
+                    content = content.push(
+                        text(tr(
+                            "The previous private key stays available for existing connections.",
+                            "原私钥会保留，已有连接不会被改写。",
+                        ))
+                        .size(14),
+                    );
+                }
             }
             content = content.push(text(tr("The private key stays on this device. After registration, cancelling setup or deleting a connection does not revoke access; remove the key in the SAI console.",
                 "私钥保存在本机。登记后，取消配置或删除连接不会撤销授权；请在 SAI 控制台移除公钥。")).size(14));
@@ -333,12 +362,8 @@ fn error_text(error: Error, locale: Locale) -> String {
         Error::VerificationPending => "仍需在浏览器确认此连接，请重试。重试会使用原来的本机密钥。",
         Error::SyncFailed => "服务未能将公钥应用到站点，请在 SAI 控制台检查。",
         Error::ApprovalExpired => "浏览器确认已过期，请重试并重新确认。重试会使用原来的本机密钥。",
-        Error::KeyRevoked => {
-            "此设备的 SSH 密钥已被撤销，重试不会恢复授权。请在 SAI 控制台检查接入权限。"
-        }
-        Error::KeyExpired => {
-            "此设备的 SSH 密钥已过期。请在 SAI 控制台检查接入权限，并使用新的密钥配置连接。"
-        }
+        Error::KeyRevoked => "此设备的 SSH 密钥已被撤销。如需再次连接，请使用新密钥重新授权。",
+        Error::KeyExpired => "此设备的 SSH 密钥已过期。请使用新密钥重新授权。",
     }
     .into()
 }
