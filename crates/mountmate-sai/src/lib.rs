@@ -1,8 +1,12 @@
 //! SAI account setup adapter. Produces ordinary MountMate connections.
 //! See docs/sai-account-setup.md for the proposed, not yet deployed service contract.
 
+mod enrollment;
 mod key;
 mod transport;
+
+pub use enrollment::EnrollmentProgress;
+use enrollment::{Enrollment, Status as EnrollmentStatus};
 
 use mountmate_core::connection::{ConnectionDraft, ConnectionSource};
 use mountmate_core::credential::CredentialKind;
@@ -50,8 +54,18 @@ pub enum Error {
     KeyStorage,
     #[error("The public key is still being applied. Retry with the same local key.")]
     SyncPending,
+    #[error("Browser confirmation is still required. Retry with the same local key.")]
+    VerificationPending,
     #[error("The service could not apply this public key. Check the SAI console.")]
     SyncFailed,
+    #[error("Browser confirmation expired. Retry to confirm the same local key.")]
+    ApprovalExpired,
+    #[error(
+        "This SSH key was revoked. Check access in the SAI console; retrying cannot restore it."
+    )]
+    KeyRevoked,
+    #[error("This SSH key expired. Check access in the SAI console and configure a new key.")]
+    KeyExpired,
 }
 
 #[derive(Clone)]
@@ -60,6 +74,7 @@ pub struct Client {
     portal: Url,
     issuer: Url,
     oauth: DeviceClient,
+    browser_verification: bool,
 }
 impl std::fmt::Debug for Client {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -191,7 +206,10 @@ impl Client {
             || config.identity_issuer != issuer.as_str().trim_end_matches('/')
             || config.oidc_client_id != CLIENT_ID
             || config.oidc_resource != RESOURCE
-            || config.ssh_access != "public-key/v1"
+            || !matches!(
+                config.ssh_access.as_str(),
+                "public-key/v1" | "public-key/v2"
+            )
         {
             return Err(Error::Contract);
         }
@@ -215,6 +233,7 @@ impl Client {
             portal,
             issuer,
             oauth,
+            browser_verification: config.ssh_access == "public-key/v2",
         })
     }
     pub async fn start_login(&self) -> Result<Login, Error> {
@@ -334,6 +353,16 @@ impl Session {
         site: &Connection,
         data_dir: &Path,
     ) -> Result<ConfiguredConnection, Error> {
+        self.enroll_with_progress(site, data_dir, |_| {}).await
+    }
+
+    /// Reports the one approved browser destination while continuing site polling.
+    pub async fn enroll_with_progress(
+        &self,
+        site: &Connection,
+        data_dir: &Path,
+        mut on_progress: impl FnMut(EnrollmentProgress),
+    ) -> Result<ConfiguredConnection, Error> {
         self.check_expiry()?;
         if !self.connections().contains(site) {
             return Err(Error::Contract);
@@ -374,7 +403,8 @@ impl Session {
                 )
                 .await?,
         )?;
-        self.wait_for_key(response, &key, site, SYNC_LIMIT).await?;
+        self.wait_for_key(response, &key, site, SYNC_LIMIT, &mut on_progress)
+            .await?;
         Ok(ConfiguredConnection {
             connection: site.clone(),
             key_file: key.path,
@@ -386,20 +416,34 @@ impl Session {
         key: &key::LocalKey,
         site: &Connection,
         limit: Duration,
+        on_progress: &mut impl FnMut(EnrollmentProgress),
     ) -> Result<(), Error> {
+        let mut verification_reported = false;
+        let mut waiting_for_verification = false;
         let wait = async {
             loop {
                 self.check_expiry()?;
-                if response.request_id != key.request_id
-                    || response.site_id != site.site_id
-                    || response.public_key_fingerprint != key.fingerprint
-                {
-                    return Err(Error::Contract);
-                }
-                match response.state {
-                    EnrollmentState::Applied => return Ok(()),
-                    EnrollmentState::Failed => return Err(Error::SyncFailed),
-                    EnrollmentState::Pending => {}
+                match response.validate(
+                    &key.request_id,
+                    &site.site_id,
+                    &key.fingerprint,
+                    &self.client.portal,
+                    self.client.browser_verification,
+                )? {
+                    EnrollmentStatus::Applied => return Ok(()),
+                    EnrollmentStatus::Pending(Some(url)) => {
+                        waiting_for_verification = true;
+                        if !verification_reported {
+                            verification_reported = true;
+                            on_progress(EnrollmentProgress::VerificationRequired(url));
+                        }
+                    }
+                    EnrollmentStatus::Pending(None) => {
+                        if waiting_for_verification {
+                            on_progress(EnrollmentProgress::Applying);
+                        }
+                        waiting_for_verification = false;
+                    }
                 }
                 tokio::time::sleep(Duration::from_secs(2)).await;
                 self.check_expiry()?;
@@ -422,9 +466,13 @@ impl Session {
                 )?;
             }
         };
-        tokio::time::timeout(limit, wait)
-            .await
-            .map_err(|_| Error::SyncPending)?
+        tokio::time::timeout(limit, wait).await.map_err(|_| {
+            if waiting_for_verification {
+                Error::VerificationPending
+            } else {
+                Error::SyncPending
+            }
+        })?
     }
     fn check_expiry(&self) -> Result<(), Error> {
         if Instant::now() >= self.expires_at {
@@ -440,20 +488,6 @@ struct Registration<'a> {
     site_id: &'a str,
     public_key: &'a str,
     label: &'a str,
-}
-#[derive(Deserialize)]
-struct Enrollment {
-    request_id: String,
-    site_id: String,
-    public_key_fingerprint: String,
-    state: EnrollmentState,
-}
-#[derive(Deserialize)]
-#[serde(rename_all = "snake_case")]
-enum EnrollmentState {
-    Pending,
-    Applied,
-    Failed,
 }
 fn trusted_url(value: &str, issuer: &Url) -> Result<Url, Error> {
     let url = Url::parse(value).map_err(|_| Error::Contract)?;
