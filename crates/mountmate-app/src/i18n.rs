@@ -430,6 +430,7 @@ pub(crate) enum TextKey {
     NoMatchingConnections,
     Open,
     OpenedMountpoint,
+    OpenSshKeyHelp,
     Optional,
     Password,
     PasswordRequired,
@@ -544,7 +545,7 @@ fn english(key: TextKey) -> &'static str {
         TextKey::LogsHelp => {
             "Open a read-only mount log viewer. Select any range to copy it, or use Copy log for the full visible log."
         }
-        TextKey::ManagedByOpenSsh => "SSH config / agent (non-interactive)",
+        TextKey::ManagedByOpenSsh => "Private key / SSH config / agent (non-interactive)",
         TextKey::MaximumAge => "Maximum age",
         TextKey::MaximumSize => "Maximum size",
         TextKey::MinimumFreeSpace => "Minimum free space",
@@ -563,6 +564,9 @@ fn english(key: TextKey) -> &'static str {
         TextKey::NoMatchingConnections => "No connections match this search",
         TextKey::Open => "Open",
         TextKey::OpenedMountpoint => "Opened mountpoint",
+        TextKey::OpenSshKeyHelp => {
+            "Optional. Leave blank to use SSH config / agent. For a passphrase-protected key, add it to ssh-agent with ssh-add first."
+        }
         TextKey::Optional => "Optional",
         TextKey::Password => "Password",
         TextKey::PasswordRequired => "Required for a new or changed target",
@@ -678,7 +682,7 @@ fn chinese(key: TextKey) -> &'static str {
         TextKey::LogsHelp => {
             "打开只读挂载日志窗口，可选中任意部分复制，或用“复制日志”复制当前显示的全部内容。"
         }
-        TextKey::ManagedByOpenSsh => "SSH 配置 / 代理（非交互式）",
+        TextKey::ManagedByOpenSsh => "私钥 / SSH 配置 / 代理（非交互式）",
         TextKey::MaximumAge => "最长保留时间",
         TextKey::MaximumSize => "最大大小",
         TextKey::MinimumFreeSpace => "最小剩余空间",
@@ -695,6 +699,9 @@ fn chinese(key: TextKey) -> &'static str {
         TextKey::NoMatchingConnections => "没有符合搜索条件的连接",
         TextKey::Open => "打开",
         TextKey::OpenedMountpoint => "已打开挂载点",
+        TextKey::OpenSshKeyHelp => {
+            "可选，留空沿用 SSH 配置 / 代理。带密码的私钥需先通过 ssh-add 加入 ssh-agent。"
+        }
         TextKey::Optional => "可选",
         TextKey::Password => "密码",
         TextKey::PasswordRequired => "新建连接或目标变化时必填",

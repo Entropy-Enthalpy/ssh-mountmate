@@ -356,6 +356,11 @@ mounts and capacity probes that need it will ask for login again; already runnin
 not automatically unmounted, but they can report transport errors until a shared session is
 re-established.
 
+For Manual and SAI preset connections using `OpenSSH`, the optional **Private key file** field lets
+you enter a path or browse for a key. Leave it blank to use your SSH config or agent. A selected
+key is passed to SSH with `-i` and `IdentitiesOnly=yes`. Imported SSH-config connections continue
+to use the identity settings in their source file.
+
 `OpenSSH` runs without login prompts and does not receive saved passwords or key passphrases from the app. Use Native SFTP for a saved password, or Interactive shared SSH for terminal password, passphrase, MFA, and first-use host-key prompts. For non-interactive OpenSSH, add passphrase-protected keys to your agent first:
 
 ```bash

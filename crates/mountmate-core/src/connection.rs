@@ -379,7 +379,13 @@ impl ConnectionDraft {
         } else {
             self.key_file.trim().to_owned()
         };
-        if requirements.key_file {
+        let explicit_openssh_key = connection_method == ConnectionMethod::Openssh
+            && matches!(
+                self.source,
+                ConnectionSource::Manual | ConnectionSource::SaiCluster
+            )
+            && !key_file.is_empty();
+        if requirements.key_file || explicit_openssh_key {
             validate_private_key(&key_file)?;
         }
         if requirements.ssh_config_path && self.ssh_config_path.trim().is_empty() {
@@ -1612,36 +1618,105 @@ mod tests {
     }
 
     #[test]
-    fn native_key_requires_an_existing_private_key() {
+    fn manual_key_auth_rejects_missing_or_public_key_files() {
         let temp = tempdir().unwrap();
         let public = temp.path().join("id_ed25519.pub");
         fs::write(&public, "public").unwrap();
+        for connection_method in [ConnectionMethod::Native, ConnectionMethod::Openssh] {
+            for source in [ConnectionSource::Manual, ConnectionSource::SaiCluster] {
+                let mut draft = ConnectionDraft {
+                    name: "Alpha".into(),
+                    host: "host.example".into(),
+                    user: "alice".into(),
+                    key_file: public.display().to_string(),
+                    connection_method,
+                    source,
+                    ..ConnectionDraft::default()
+                };
+                assert_eq!(draft.validate(&[]), Err(DraftError::PublicKey));
+                for path in [temp.path().join("missing"), temp.path().to_owned()] {
+                    draft.key_file = path.display().to_string();
+                    assert!(matches!(
+                        draft.validate(&[]),
+                        Err(DraftError::KeyMissing(_))
+                    ));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn openssh_allows_default_authentication_without_a_key_file() {
+        for source in [ConnectionSource::Manual, ConnectionSource::SaiCluster] {
+            let draft = ConnectionDraft {
+                name: "Alpha".into(),
+                host: "host.example".into(),
+                user: "alice".into(),
+                auth: AuthMethod::Password,
+                key_file: " \t ".into(),
+                connection_method: ConnectionMethod::Openssh,
+                source,
+                ..ConnectionDraft::default()
+            };
+            assert!(!draft.requirements().key_file);
+            let validated = draft.validate(&[]).unwrap();
+            assert_eq!(validated.server.auth, AuthMethod::Key);
+            assert!(validated.server.key_file.is_empty());
+        }
+    }
+
+    #[test]
+    fn openssh_import_does_not_validate_cached_key_files() {
+        for source in [
+            ConnectionSource::SshConfig,
+            ConnectionSource::SshConfigBatch,
+        ] {
+            let draft = ConnectionDraft {
+                name: "Alpha".into(),
+                host_alias: "alpha".into(),
+                host: "host.example".into(),
+                user: "alice".into(),
+                key_file: "/missing/cached-key.pub".into(),
+                ssh_config_path: "~/.ssh/config".into(),
+                connection_method: ConnectionMethod::Openssh,
+                source,
+                ..ConnectionDraft::default()
+            };
+            assert!(draft.validate(&[]).is_ok());
+        }
+    }
+
+    #[test]
+    fn openssh_private_key_survives_save_reload_and_transport_switches() {
+        let temp = tempdir().unwrap();
+        let key = temp.path().join("private key");
+        fs::write(&key, "private").unwrap();
         let mut draft = ConnectionDraft {
             name: "Alpha".into(),
             host: "host.example".into(),
             user: "alice".into(),
-            key_file: public.display().to_string(),
-            ..ConnectionDraft::default()
-        };
-        assert_eq!(draft.validate(&[]), Err(DraftError::PublicKey));
-        draft.key_file = temp.path().join("missing").display().to_string();
-        assert!(matches!(
-            draft.validate(&[]),
-            Err(DraftError::KeyMissing(_))
-        ));
-    }
-
-    #[test]
-    fn openssh_forces_key_auth_without_native_key_validation() {
-        let draft = ConnectionDraft {
-            name: "Alpha".into(),
-            host: "host.example".into(),
-            user: "alice".into(),
             auth: AuthMethod::Password,
+            key_file: format!("  {}  ", key.display()),
+            key_passphrase: "native-only-passphrase".into(),
             connection_method: ConnectionMethod::Openssh,
             ..ConnectionDraft::default()
         };
-        assert_eq!(draft.validate(&[]).unwrap().server.auth, AuthMethod::Key);
+        let validated = draft.validate(&[]).unwrap();
+        assert_eq!(validated.key_passphrase, SecretAction::Clear);
+        let saved: ServerConfig =
+            serde_json::from_value(serde_json::to_value(validated.server).unwrap()).unwrap();
+        draft = ConnectionDraft::from_server(&saved);
+        assert_eq!(draft.key_file, key.to_str().unwrap());
+        for method in [
+            ConnectionMethod::Native,
+            ConnectionMethod::Interactive,
+            ConnectionMethod::Openssh,
+        ] {
+            draft.set_connection_method(method);
+            assert_eq!(draft.validate(&[]).unwrap().server.key_file, saved.key_file);
+        }
+        draft.key_file.clear();
+        assert!(draft.validate(&[]).unwrap().server.key_file.is_empty());
     }
 
     #[test]

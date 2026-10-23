@@ -7905,6 +7905,17 @@ impl App {
                     );
                 }
             }
+        } else if draft.connection_method == ConnectionMethod::Openssh {
+            auth_fields = auth_fields
+                .push(controls.file(
+                    locale.text(TextKey::PrivateKeyFile),
+                    &draft.key_file,
+                    ConnectionField::KeyFile,
+                    Message::BrowsePrivateKey,
+                    locale.text(TextKey::Browse),
+                    requirements.key_file,
+                ))
+                .push(text(locale.text(TextKey::OpenSshKeyHelp)).size(13));
         }
         let mut managed_fields = column![].spacing(10);
         if matches!(
