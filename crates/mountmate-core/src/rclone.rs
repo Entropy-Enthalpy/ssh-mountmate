@@ -975,12 +975,31 @@ mod tests {
             ..ServerConfig::default()
         };
 
-        let remote = RcloneRemote::for_server(&server, None, None, false).unwrap();
-        let command = remote.options.iter().find(|(key, _)| key == "ssh").unwrap();
+        for (windows, quoted_key) in [
+            (false, "'/home/user/key file'"),
+            (true, "\"/home/user/key file\""),
+        ] {
+            let remote = RcloneRemote::for_server(&server, None, None, windows).unwrap();
+            let command = remote.options.iter().find(|(key, _)| key == "ssh").unwrap();
 
-        assert!(command.1.contains("'/home/user/key file'"));
-        assert!(!remote.options.iter().any(|(key, _)| key == "pass"));
-        assert!(!command.1.contains("must-not-appear"));
+            assert!(
+                command
+                    .1
+                    .contains(&format!("-i {quoted_key} -o IdentitiesOnly=yes"))
+            );
+            assert!(!remote.options.iter().any(|(key, _)| key == "pass"));
+            assert!(!command.1.contains("must-not-appear"));
+        }
+
+        let mut without_key = server;
+        without_key.key_file.clear();
+        let arguments = openssh_target_arguments(&without_key).unwrap();
+        assert!(!arguments.iter().any(|arg| arg == "-i"));
+        assert!(
+            !arguments
+                .iter()
+                .any(|arg| arg.starts_with("IdentitiesOnly="))
+        );
     }
 
     #[test]
